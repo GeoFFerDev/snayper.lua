@@ -1,18 +1,23 @@
 --[[
   SNIPER SCRIPT v3 — Universal Mobile FPS
   ══════════════════════════════════════════════════════════════
-  GYRO BUG ROOT CAUSE (now fixed):
+  GYRO BUG ROOT CAUSES (all fixed):
   ──────────────────────────────────────────────────────────────
-  GetDeviceRotation() returns (InputObject, CFrame) — two values.
-  All previous versions captured only the FIRST return (InputObject),
-  then called :Inverse() on it → silent crash → render step dead
-  every frame → camera frozen pointing at floor.
+  BUG 1 (original): GetDeviceRotation() returns (InputObject, CFrame).
+  Previous versions captured only the FIRST return (InputObject),
+  then called :Inverse() on it → silent crash → render dead every frame.
+  FIXED: Use DeviceRotationChanged 2nd param (absolute CFrame).
 
-  FIX: Use DeviceRotationChanged(inputObj, absoluteCFrame).
-  The SECOND parameter is the absolute device CFrame, correct type,
-  no pcall needed. Store latest per event, diff once per render frame
-  at Last priority (2000) — runs after everything including the game's
-  own CameraModHandle auto-aim lerp.
+  BUG 2 (weapon frozen): Gyro ran at Last(2000) AFTER the game's
+  "pitchYaw" step at Camera+15 already read camera.CFrame and wrote
+  Entity.Pitch/Entity.Yaw — which the weapon animator reads every frame.
+  Camera moved visually but the weapon was posed to the pre-gyro angle.
+  FIXED: Run gyro at Camera+5 so pitchYaw captures the gyro-updated angle.
+
+  BUG 3 (tilt away/toward broken): In LandscapeRight, device CFrame axes
+  are remapped ~90° from portrait. Tilt-toward/away maps to dy not dx.
+  Script was extracting dx and discarding dy with _.
+  FIXED: Extract dy as pitch driver instead of dx.
 
   AUTO-AIM SLIDING FIX:
   ──────────────────────────────────────────────────────────────
@@ -163,7 +168,7 @@ UserInputService.DeviceRotationChanged:Connect(function(_, absCFrame)
 end)
 
 -- Apply once per render frame at absolute Last priority
-RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Last.Value, function()
+RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Camera.Value + 5, function()
     if not Config.Gyro then
         -- Disable: reset references so next enable starts clean
         gyroPrevAbsCF   = nil
@@ -185,18 +190,23 @@ RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Last.Value, function(
     local delta = gyroPrevAbsCF:Inverse() * gyroLatestAbsCF
     gyroPrevAbsCF = gyroLatestAbsCF   -- advance baseline
 
-    -- Decompose delta into Euler components
-    local dx, _, dz = delta:ToEulerAnglesXYZ()
+    -- Decompose delta into Euler components.
+    -- In LandscapeRight orientation the device CFrame is rotated ~90° around Z
+    -- vs portrait, which remaps axes:
+    --   dy → tilt top of phone toward/away from face → PITCH  (was dx in portrait)
+    --   dz → rotate phone face left/right            → YAW    (unchanged)
+    --   dx → roll (screen twist)                     → IGNORED
+    local _, dy, dz = delta:ToEulerAnglesXYZ()
 
     -- Deadzone: filter sensor vibration / noise floor (~0.05 deg)
     local DZ = 0.001
-    if math.abs(dx) < DZ then dx = 0 end
+    if math.abs(dy) < DZ then dy = 0 end
     if math.abs(dz) < DZ then dz = 0 end
-    if dx == 0 and dz == 0 then return end
+    if dy == 0 and dz == 0 then return end
 
     -- Safety clamp: prevents giant jump on re-enable or edge case
     local MAX = 0.035   -- ~2 degrees per frame max
-    dx = math.clamp(dx, -MAX, MAX)
+    dy = math.clamp(dy, -MAX, MAX)
     dz = math.clamp(dz, -MAX, MAX)
 
     -- Scale: slider 1–10 → effective multiplier 0.15 – 1.5
@@ -204,14 +214,14 @@ RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Last.Value, function(
     local scaleH = Config.GyroSensH * 0.15
 
     -- Sign convention (landscape right):
-    --   Tilt top of phone away from you  → dx > 0 → aim DOWN  → pitch decreases
-    --   Tilt top of phone toward you     → dx < 0 → aim UP    → pitch increases
+    --   Tilt top of phone away from you  → dy > 0 → aim DOWN  → pitch decreases
+    --   Tilt top of phone toward you     → dy < 0 → aim UP    → pitch increases
     --   Rotate phone face-right          → dz < 0 → look right→ yaw increases
     -- InvertV/H toggles in UI flip these for personal preference
     local signV = Config.GyroInvertV and 1 or -1
     local signH = Config.GyroInvertH and 1 or -1
 
-    local dPitch = signV * dx * scaleV
+    local dPitch = signV * dy * scaleV
     local dYaw   = signH * dz * scaleH   -- dz < 0 for right, signH -1 → +yaw
 
     -- Apply to camera — runs at Last(2000) so nothing overwrites this
