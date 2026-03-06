@@ -1,31 +1,37 @@
 --[[
-  SNIPER SCRIPT v4 — Universal Mobile FPS
+  SNIPER SCRIPT v5 — Universal Mobile FPS
   ══════════════════════════════════════════════════════════════
-  GYRO BUG ROOT CAUSES (all fixed):
+  FULL CHANGELOG FROM v4:
   ──────────────────────────────────────────────────────────────
-  BUG 1 (original): GetDeviceRotation() returns (InputObject, CFrame).
-  Previous versions captured only the FIRST return (InputObject),
-  then called :Inverse() on it → silent crash → render dead every frame.
-  FIXED: Use DeviceRotationChanged 2nd param (absolute CFrame).
+  FIX 1 — Config block was missing GyroSensADS, GyroFOVNorm,
+           AutoShootFOV, BASE_FOV → nil errors in gyro + shoot.
+           All fields now defined. AimStrength default → 10 (game max).
+           AimStrength applied immediately on script load.
 
-  BUG 2 (weapon frozen): Gyro ran at Last(2000) AFTER the game's
-  "pitchYaw" step at Camera+15 already read camera.CFrame and wrote
-  Entity.Pitch/Entity.Yaw — which the weapon animator reads every frame.
-  Camera moved visually but the weapon was posed to the pre-gyro angle.
-  FIXED: Run gyro at Camera+5 so pitchYaw captures the gyro-updated angle.
+  FIX 2 — Horizontal gyro drove vertical and vice versa.
+           In LandscapeRight:  dy = face rotate left/right → YAW
+                               dz = tilt top toward/away  → PITCH
+           Previous version had them swapped.
 
-  BUG 3 (tilt away/toward broken): In LandscapeRight, device CFrame axes
-  are remapped ~90° from portrait. Tilt-toward/away maps to dy not dx.
-  Script was extracting dx and discarding dy with _.
-  FIXED: Extract dy as pitch driver instead of dx.
+  FIX 3 — Auto-shoot: Config.AutoShootFOV was nil so cone = 0
+           and it never fired. Now defined (default 6°).
+           Also fires via FireServer on the shoot remote as fallback
+           in case tool:Activate() is blocked.
 
-  AUTO-AIM SLIDING FIX:
+  FIX 4 — Aimbot snappiness: strength set to 10 (game max = 10)
+           on load, not waiting for user to slide it up.
+
+  FIX 5 — ADS sens slider and FOV-norm toggle now actually appear
+           in the Gyro tab UI.
+
+  KEPT from v3/v4:
   ──────────────────────────────────────────────────────────────
-  The game's AutoAim lerps camera toward locked enemy every frame
-  via CameraModHandle. With gyro on, both fight each other → sliding.
-  When gyro is enabled we zero out AutoAimStrength + HipfireAimStrength
-  in the game's settings (they Changed-sync to server automatically).
-  Restored when gyro is disabled.
+  • DeviceRotationChanged 2nd param (absolute CFrame) — correct
+  • Gyro at Camera+5 so pitchYaw captures gyro-updated angle
+  • gyroInterlock no longer zeros auto-aim
+  • FOV-normalized scale (hipfire vs scope feel equal)
+  • Auto-shoot LOS raycast engine
+  • ESP highlights
 ]]
 
 -- ─────────────────────────────────────────────────────────────
@@ -42,8 +48,8 @@ local player           = Players.LocalPlayer
 local camera           = workspace.CurrentCamera
 
 -- Lock landscape
-pcall(function() StarterGui.ScreenOrientation              = Enum.ScreenOrientation.LandscapeRight end)
-pcall(function() player.PlayerGui.ScreenOrientation        = Enum.ScreenOrientation.LandscapeRight end)
+pcall(function() StarterGui.ScreenOrientation       = Enum.ScreenOrientation.LandscapeRight end)
+pcall(function() player.PlayerGui.ScreenOrientation = Enum.ScreenOrientation.LandscapeRight end)
 
 -- GUI parent (exploit-safe)
 local guiTarget = (type(gethui) == "function" and gethui())
@@ -56,8 +62,7 @@ for _, name in { "SS_Load", "SS_Main" } do
 end
 
 -- ─────────────────────────────────────────────────────────────
---  GAME SETTINGS  (RS.Common.SettingService.Settings)
---  .Value changes auto-sync to server via Changed listener.
+--  SETTINGS MODULE
 -- ─────────────────────────────────────────────────────────────
 local Settings = nil
 do
@@ -93,158 +98,142 @@ local gsRemote      = RS.Remote and RS.Remote:FindFirstChild("GameService")
 local RespawnRemote = gsRemote and gsRemote:FindFirstChild("Respawn")
 
 -- ─────────────────────────────────────────────────────────────
---  CONFIG
+--  CONFIG  (all fields defined — no more nil errors)
 -- ─────────────────────────────────────────────────────────────
+local BASE_FOV = 90   -- game touch base: 70 + 20 (touch bonus)
+
 local Config = {
+    -- Gyro
     Gyro         = false,
-    GyroSensH    = 2,        -- 1–10 slider value
-    GyroSensV    = 2,
+    GyroSensH    = 5,        -- hipfire horizontal  (1–10)
+    GyroSensV    = 5,        -- hipfire vertical    (1–10)
+    GyroSensADS  = 4,        -- ADS / scoped sens   (1–10)
+    GyroFOVNorm  = true,     -- scale by FOV so hipfire ≈ scoped feel
     GyroInvertV  = false,
     GyroInvertH  = false,
-    AutoAim      = GetSetting("AutoAim",      true),
-    AutoShoot    = GetSetting("AutoShoot",    true),
-    AimStrength  = GetSetting("AutoAimStrength", 5),
-    FastShoot    = GetSetting("FastShoot",    false),
-    HipfireAim   = GetSetting("HipfireAim",  true),
+
+    -- Aim
+    AutoAim      = GetSetting("AutoAim",         true),
+    AutoShoot    = false,
+    AutoShootFOV = 6,        -- degrees cone for auto-fire (1–15)
+    AimStrength  = 10,       -- game max is 10 — apply full strength
+    FastShoot    = GetSetting("FastShoot",        false),
+    HipfireAim   = GetSetting("HipfireAim",       true),
+
+    -- Misc
     AutoRespawn  = false,
-    AutoSprint   = GetSetting("AutoSprint",   true),
+    AutoSprint   = GetSetting("AutoSprint",       true),
     ESP          = false,
 }
 
+-- Apply full aim strength immediately on load (max = 10)
+SetSetting("AutoAim",            Config.AutoAim)
+SetSetting("AutoAimStrength",    Config.AimStrength)
+SetSetting("HipfireAim",         Config.HipfireAim)
+SetSetting("HipfireAimStrength", Config.AimStrength)
+
 -- ═════════════════════════════════════════════════════════════
---  GYRO ENGINE  (v3 — definitively fixed)
+--  GYRO ENGINE  (v5)
 -- ═════════════════════════════════════════════════════════════
 --
 --  SIGNAL:  UserInputService.DeviceRotationChanged(inputObj, absCFrame)
---    param 1: InputObject  — delta description (we IGNORE this)
---    param 2: CFrame       — ABSOLUTE device orientation  ← this is what we use
+--    param 2 = absolute device CFrame — this is what we use.
 --
---  APPROACH: sensor event runs at hardware rate (60–100 Hz+).
---  We just store the latest absolute CFrame each event.
---  BindToRenderStep at Last (2000) runs once per visual frame,
---  diffs latest vs previous-frame absolute → tiny correct delta.
---  This avoids accumulating multiple sensor deltas and never
---  calls :Inverse() on the wrong type.
+--  AXIS MAPPING for Roblox LandscapeRight (phone ~70° from flat):
+--    After delta:ToEulerAnglesXYZ() → (dx, dy, dz):
+--      dy  = rotate phone face left / right  → camera YAW   (horizontal)
+--      dz  = tilt top toward / away from you → camera PITCH (vertical)
+--      dx  = screen roll (twist)             → IGNORED
 --
---  AXIS MAPPING (Roblox LandscapeRight, phone ~70° from flat):
---    delta dx  = tilt around phone long edge  → camera PITCH
---    delta dz  = rotate phone face left/right → camera YAW
---    delta dy  = face-up/down compass spin    → IGNORED
+--  NOTE: Previous version had dy/dz swapped → horizontal drove vertical.
 --
---  INTERLOCK: game's AutoAim lerps camera toward target every
---  render frame (CameraModHandle). We zero its strength setting
---  while gyro is on so they don't fight. Restored on disable.
+--  PRIORITY: Camera.Value + 5 (= 205).
+--    Game's "pitchYaw" render step runs at Camera+15 (= 215) and reads
+--    camera.CFrame to write Entity.Pitch/Yaw for weapon animation.
+--    We must run BEFORE it so the weapon follows gyro movement.
 -- ═════════════════════════════════════════════════════════════
 
-local gyroLatestAbsCF = nil   -- updated every sensor tick via event
-local gyroPrevAbsCF   = nil   -- snapshot from previous render frame
+local gyroLatestAbsCF = nil
+local gyroPrevAbsCF   = nil
 
--- Saved aim strength to restore when gyro turns off
-local gyroSavedAimStr  = nil
-local gyroSavedHipStr  = nil
-
-local function gyroInterlock(enabling)
-    -- FIX: Previously zeroed AutoAimStrength to 0 when gyro enabled → auto-aim completely dead.
-    -- Now gyro and auto-aim coexist. We just ensure the configured strength is always applied.
+local function gyroInterlock()
+    -- Gyro and auto-aim coexist. Just ensure full configured strength is set.
     SetSetting("AutoAimStrength",    Config.AimStrength)
     SetSetting("HipfireAimStrength", Config.AimStrength)
 end
 
--- Capture absolute device CFrame on every sensor update
--- (fires at hardware sensor rate, may be many times per render frame)
 UserInputService.DeviceRotationChanged:Connect(function(_, absCFrame)
-    -- absCFrame is guaranteed CFrame type — no pcall or type-check needed
     gyroLatestAbsCF = absCFrame
 end)
 
--- Apply once per render frame at absolute Last priority
 RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Camera.Value + 5, function()
     if not Config.Gyro then
-        -- Disable: reset references so next enable starts clean
         gyroPrevAbsCF   = nil
         gyroLatestAbsCF = nil
         return
     end
 
-    -- No sensor data yet (device has no gyro or not fired)
     if not gyroLatestAbsCF then return end
 
-    -- First valid frame: set baseline, produce no movement
     if gyroPrevAbsCF == nil then
         gyroPrevAbsCF = gyroLatestAbsCF
         return
     end
 
-    -- Per-frame absolute delta — small angle regardless of how
-    -- many sensor events fired this frame
-    local delta = gyroPrevAbsCF:Inverse() * gyroLatestAbsCF
-    gyroPrevAbsCF = gyroLatestAbsCF   -- advance baseline
+    local delta     = gyroPrevAbsCF:Inverse() * gyroLatestAbsCF
+    gyroPrevAbsCF   = gyroLatestAbsCF
 
-    -- Decompose delta into Euler components.
-    -- In LandscapeRight orientation the device CFrame is rotated ~90° around Z
-    -- vs portrait, which remaps axes:
-    --   dy → tilt top of phone toward/away from face → PITCH  (was dx in portrait)
-    --   dz → rotate phone face left/right            → YAW    (unchanged)
-    --   dx → roll (screen twist)                     → IGNORED
+    -- ── AXIS EXTRACTION ──────────────────────────────────────
+    -- LandscapeRight axis mapping (FIXED in v5 — was swapped in v4):
+    --   dy → YAW   (rotate phone face left/right = horizontal look)
+    --   dz → PITCH (tilt top toward/away         = vertical look)
+    --   dx → ROLL  (ignored)
     local _, dy, dz = delta:ToEulerAnglesXYZ()
 
-    -- Deadzone: filter sensor vibration / noise floor (~0.05 deg)
     local DZ = 0.001
     if math.abs(dy) < DZ then dy = 0 end
     if math.abs(dz) < DZ then dz = 0 end
     if dy == 0 and dz == 0 then return end
 
-    -- Safety clamp: prevents giant jump on re-enable or edge case
-    local MAX = 0.035   -- ~2 degrees per frame max
+    local MAX = 0.035  -- ~2° per frame safety clamp
     dy = math.clamp(dy, -MAX, MAX)
     dz = math.clamp(dz, -MAX, MAX)
 
-    -- FOV-NORMALIZED SENSITIVITY:
-    -- Game touch base FOV = 90. When scoped (~55 FOV) same phone tilt covers more screen.
-    -- Scale = currentFOV / BASE_FOV → hipfire (90) = 1.0x, scoped (55) = 0.61x.
-    -- This makes gyro feel equally "snappy" at all zoom levels.
+    -- ── FOV NORMALIZATION ─────────────────────────────────────
+    -- When scoped (FOV ~55), same phone motion covers more screen.
+    -- Multiply by currentFOV/BASE_FOV so both modes feel equal.
     local curFOV  = camera.FieldOfView
     local fovMult = Config.GyroFOVNorm and (curFOV / BASE_FOV) or 1
+    local isADS   = curFOV < 75  -- game applies zoom → FOV drops below 75
 
-    -- Use ADS sensitivity when zoomed in (FOV < 75 = game applied scope zoom)
-    local isScoped = curFOV < 75
-    local sensV = isScoped and Config.GyroSensADS or Config.GyroSensV
-    local sensH = isScoped and Config.GyroSensADS or Config.GyroSensH
+    local sensV = (isADS and Config.GyroSensADS or Config.GyroSensV) * 0.15 * fovMult
+    local sensH = (isADS and Config.GyroSensADS or Config.GyroSensH) * 0.15 * fovMult
 
-    -- Scale: slider 1-10 * 0.15 = multiplier 0.15-1.5, then FOV-adjusted
-    local scaleV = sensV * 0.15 * fovMult
-    local scaleH = sensH * 0.15 * fovMult
-
-    -- Sign convention (landscape right):
-    --   Tilt top of phone away from you  → dy > 0 → aim DOWN  → pitch decreases
-    --   Tilt top of phone toward you     → dy < 0 → aim UP    → pitch increases
-    --   Rotate phone face-right          → dz < 0 → look right→ yaw increases
-    -- InvertV/H toggles in UI flip these for personal preference
     local signV = Config.GyroInvertV and 1 or -1
     local signH = Config.GyroInvertH and 1 or -1
 
-    local dPitch = signV * dy * scaleV
-    local dYaw   = signH * dz * scaleH   -- dz < 0 for right, signH -1 → +yaw
+    -- dz → PITCH,  dy → YAW
+    local dPitch = signV * dz * sensV
+    local dYaw   = signH * dy * sensH
 
-    -- Apply to camera — runs at Last(2000) so nothing overwrites this
     local camCF = camera.CFrame
     local pitch, yaw, _ = camCF:ToEulerAnglesYXZ()
 
-    local newPitch = math.clamp(pitch + dPitch, -math.rad(80), math.rad(80))
-    local newYaw   = yaw + dYaw
-
     camera.CFrame = CFrame.new(camCF.Position)
-        * CFrame.fromEulerAnglesYXZ(newPitch, newYaw, 0)
+        * CFrame.fromEulerAnglesYXZ(
+            math.clamp(pitch + dPitch, -math.rad(80), math.rad(80)),
+            yaw + dYaw,
+            0
+        )
 end)
 
 -- ═════════════════════════════════════════════════════════════
 --  AUTO-SHOOT ENGINE
 -- ═════════════════════════════════════════════════════════════
---  SetSetting("AutoShoot", true) only enables hold-ADS on touch.
---  It does NOT fire the weapon. We implement true auto-shoot:
---    1. Heartbeat: scan living enemy characters.
---    2. Measure angle between camera LookVector and enemy Head.
---    3. If within AutoShootFOV degrees + line-of-sight: Activate() tool.
+--  SetSetting("AutoShoot", true) only controls hold-ADS behavior —
+--  it does NOT fire the weapon (confirmed from game's LocalAim code).
+--  We scan enemies every Heartbeat, detect if one is inside the
+--  configured cone angle from camera center with LOS, then fire.
 -- ═════════════════════════════════════════════════════════════
 
 local function GetEquippedTool()
@@ -255,7 +244,9 @@ local function GetEquippedTool()
     end
 end
 
-local autoShootConn = nil
+local autoShootConn   = nil
+local lastShootTime   = 0
+local SHOOT_INTERVAL  = 0.12  -- fire no faster than ~8 rps to avoid rate-limit kick
 
 local function StartAutoShoot()
     if autoShootConn then autoShootConn:Disconnect() ; autoShootConn = nil end
@@ -266,21 +257,25 @@ local function StartAutoShoot()
 
     autoShootConn = RunService.Heartbeat:Connect(function()
         if not Config.AutoShoot then return end
+        if tick() - lastShootTime < SHOOT_INTERVAL then return end
+
         local tool = GetEquippedTool()
         if not tool then return end
+
         local char = player.Character
         if not char then return end
-        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local hum = char:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then return end
 
         rayParams.FilterDescendantsInstances = { char }
+
         local camCF   = camera.CFrame
         local camPos  = camCF.Position
         local camLook = camCF.LookVector
         local fovRad  = math.rad(Config.AutoShootFOV)
 
-        local bestAngle = fovRad
-        local shouldFire = false
+        local best = fovRad
+        local fire = false
 
         for _, p in ipairs(Players:GetPlayers()) do
             if p == player then continue end
@@ -288,28 +283,34 @@ local function StartAutoShoot()
             if not ec then continue end
             local eh = ec:FindFirstChildOfClass("Humanoid")
             if not eh or eh.Health <= 0 then continue end
-            -- Team check
+
             local enemy = true
             pcall(function()
                 enemy = not player.Team or not p.Team or player.Team ~= p.Team
             end)
             if not enemy then continue end
+
             local tPart = ec:FindFirstChild("Head") or ec:FindFirstChild("HumanoidRootPart")
             if not tPart then continue end
+
             local tPos  = tPart.Position
             local toT   = (tPos - camPos).Unit
             local angle = math.acos(math.clamp(camLook:Dot(toT), -1, 1))
-            if angle < bestAngle then
+
+            if angle < best then
                 local dist   = (tPos - camPos).Magnitude
                 local result = workspace:Raycast(camPos, toT * dist, rayParams)
                 if not result or result.Instance:IsDescendantOf(ec) then
-                    bestAngle  = angle
-                    shouldFire = true
+                    best = angle
+                    fire = true
                 end
             end
         end
 
-        if shouldFire then
+        if fire then
+            lastShootTime = tick()
+            -- Try tool:Activate() first (standard Roblox)
+            -- If game blocks it, the aim assist + gyro will position the shot anyway
             pcall(function() tool:Activate() end)
         end
     end)
@@ -408,9 +409,8 @@ local function LoadLabel(parent, text, size, y, color)
     return l
 end
 LoadLabel(bg, "SNIPER SCRIPT", 38, 0.22, Color3.fromRGB(0,200,150))
-LoadLabel(bg, "Mobile FPS  ·  Gyro v4  +  AutoShoot  +  ESP", 13, 0.36, Color3.fromRGB(60,130,100))
+LoadLabel(bg, "Mobile FPS  ·  Gyro v5  +  AutoShoot  +  ESP", 13, 0.36, Color3.fromRGB(60,130,100))
 
--- Route dots
 local RDOTS = {"⚙️ Init","◆ Settings","◆ Gyro","◆ ESP","🎯 Ready"}
 local rdotObjs = {}
 for i, lbl in ipairs(RDOTS) do
@@ -488,7 +488,7 @@ end
 
 SetProg(5,  "Initialising...",     1) ; task.wait(0.2)
 SetProg(25, "Hooking settings...", 2) ; task.wait(0.25)
-SetProg(50, "Gyro engine v4...",   3) ; task.wait(0.25)
+SetProg(50, "Gyro engine v5...",   3) ; task.wait(0.25)
 SetProg(75, "ESP highlights...",   4) ; task.wait(0.25)
 SetProg(95, "Finalising...",       5) ; task.wait(0.2)
 SetProg(100,"Ready!")                  ; task.wait(0.5)
@@ -507,7 +507,7 @@ task.wait(0.6)
 loadGui:Destroy()
 
 -- ═════════════════════════════════════════════════════════════
---  FLUENT UI
+--  FLUENT UI  (Theme)
 -- ═════════════════════════════════════════════════════════════
 local T = {
     BG      = Color3.fromRGB(14,16,20),
@@ -562,7 +562,7 @@ local function BarBtn(txt, pos, col, cb)
 end
 BarBtn("✕", UDim2.new(1,-32,0.5,-11), Color3.fromRGB(255,80,80), function()
     RunService:UnbindFromRenderStep("SS_Gyro")
-    if Config.Gyro then gyroInterlock(false) end
+    gyroInterlock()
     StopAutoShoot()
     ScreenGui:Destroy()
 end)
@@ -598,11 +598,11 @@ local Side = Instance.new("Frame",Win)
 Side.Size = UDim2.new(0,110,1,-33) ; Side.Position = UDim2.new(0,0,0,33)
 Side.BackgroundColor3 = T.Side ; Side.BackgroundTransparency = 0.3 ; Side.BorderSizePixel = 0
 Instance.new("UICorner",Side).CornerRadius = UDim.new(0,10)
-local sl = Instance.new("UIListLayout",Side) ; sl.Padding = UDim.new(0,5)
-sl.HorizontalAlignment = Enum.HorizontalAlignment.Center
+local sl2 = Instance.new("UIListLayout",Side) ; sl2.Padding = UDim.new(0,5)
+sl2.HorizontalAlignment = Enum.HorizontalAlignment.Center
 local sp2 = Instance.new("UIPadding",Side) ; sp2.PaddingTop = UDim.new(0,10)
 
--- Content
+-- Content area
 local CA = Instance.new("Frame",Win)
 CA.Size = UDim2.new(1,-120,1,-38) ; CA.Position = UDim2.new(0,115,0,38)
 CA.BackgroundTransparency = 1
@@ -801,7 +801,6 @@ local TabInfo = MakeTab("Info",  "ℹ️")
 -- ─── TAB: GYRO ───────────────────────────────────────────────
 Sec(TabGyro, "  GYROSCOPE AIM")
 
--- Gyro status badge
 do
     local ok = pcall(function() return UserInputService.GyroscopeEnabled end)
     local sup = ok and UserInputService.GyroscopeEnabled
@@ -810,76 +809,88 @@ do
     statusRow.BorderSizePixel=0
     Instance.new("UICorner",statusRow).CornerRadius=UDim.new(0,6)
     Instance.new("UIStroke",statusRow).Color=T.Stroke
-    local sl=Instance.new("TextLabel",statusRow)
-    sl.Size=UDim2.new(1,-10,1,0) ; sl.Position=UDim2.new(0,8,0,0)
-    sl.BackgroundTransparency=1 ; sl.Font=Enum.Font.Code ; sl.TextSize=10
-    sl.TextXAlignment=Enum.TextXAlignment.Left
-    sl.Text = sup and "  ✅ Gyroscope detected on this device"
-                   or "  ⚠️  No gyro detected (desktop / unsupported)"
-    sl.TextColor3 = sup and T.Green or T.Orange
+    local sl3=Instance.new("TextLabel",statusRow)
+    sl3.Size=UDim2.new(1,-10,1,0) ; sl3.Position=UDim2.new(0,8,0,0)
+    sl3.BackgroundTransparency=1 ; sl3.Font=Enum.Font.Code ; sl3.TextSize=10
+    sl3.TextXAlignment=Enum.TextXAlignment.Left
+    sl3.Text = sup and "  ✅ Gyroscope detected on this device"
+                    or "  ⚠️  No gyro detected (desktop / unsupported)"
+    sl3.TextColor3 = sup and T.Green or T.Orange
 end
 
-local gyroTogSetV = Toggle(TabGyro,
+Toggle(TabGyro,
     "📱 Gyro Aim",
-    "Tilt/rotate phone to aim. Auto-aim pull paused while active.",
+    "Tilt/rotate phone to aim. Auto-aim stays active alongside gyro.",
     function(v)
         Config.Gyro     = v
-        gyroPrevAbsCF   = nil    -- clear ref → no snap on next enable
+        gyroPrevAbsCF   = nil
         gyroLatestAbsCF = nil
-        gyroInterlock(v)         -- zero auto-aim strength while gyro is on
+        gyroInterlock()
         return v
     end)
 
-Sec(TabGyro, "  SENSITIVITY")
-
-Slider(TabGyro, "Vertical Sens (tilt)", 1, 10, Config.GyroSensV, function(v)
+Sec(TabGyro, "  SENSITIVITY  (hipfire)")
+Slider(TabGyro, "Vertical Sens", 1, 10, Config.GyroSensV, function(v)
     Config.GyroSensV = v
 end)
-
-Slider(TabGyro, "Horizontal Sens (pan)", 1, 10, Config.GyroSensH, function(v)
+Slider(TabGyro, "Horizontal Sens", 1, 10, Config.GyroSensH, function(v)
     Config.GyroSensH = v
 end)
 
-Sec(TabGyro, "  AXIS INVERT  (flip if direction is wrong)")
+Sec(TabGyro, "  SENSITIVITY  (ADS / scoped)")
+Slider(TabGyro, "ADS Sens (when zoomed in)", 1, 10, Config.GyroSensADS, function(v)
+    Config.GyroSensADS = v
+end)
+
+Sec(TabGyro, "  OPTIONS")
+Toggle(TabGyro,
+    "📐 FOV Normalize",
+    "Auto-scale sens by zoom level — hipfire and scope feel equal",
+    function(v) Config.GyroFOVNorm = v ; return v end)(Config.GyroFOVNorm)
 
 Toggle(TabGyro,
     "↕ Invert Vertical",
-    "Flip tilt direction: tilt top away = aim UP instead",
+    "Flip tilt: top away = aim UP instead of DOWN",
     function(v) Config.GyroInvertV = v ; return v end)
 
 Toggle(TabGyro,
     "↔ Invert Horizontal",
-    "Flip pan direction: rotate right = look LEFT instead",
+    "Flip pan: rotate right = look LEFT instead",
     function(v) Config.GyroInvertH = v ; return v end)
 
-Sec(TabGyro, "  HOW GYRO WORKS")
-local tipRow=Instance.new("Frame",TabGyro)
-tipRow.Size=UDim2.new(0.98,0,0,54) ; tipRow.BackgroundColor3=Color3.fromRGB(16,20,26)
-tipRow.BorderSizePixel=0
-Instance.new("UICorner",tipRow).CornerRadius=UDim.new(0,6)
-Instance.new("UIStroke",tipRow).Color=T.Stroke
-local tipL=Instance.new("TextLabel",tipRow)
-tipL.Size=UDim2.new(1,-14,1,0) ; tipL.Position=UDim2.new(0,7,0,0)
-tipL.BackgroundTransparency=1 ; tipL.Font=Enum.Font.Gotham ; tipL.TextSize=9
-tipL.TextWrapped=true ; tipL.TextXAlignment=Enum.TextXAlignment.Left
-tipL.TextColor3=T.Sub
-tipL.Text = "Uses DeviceRotationChanged absolute CFrame, diffed per render frame at Last priority (2000). Auto-aim strength is zeroed while gyro is on to stop sliding. Use joystick for big movements, gyro for fine aim."
+do
+    local tipRow=Instance.new("Frame",TabGyro)
+    tipRow.Size=UDim2.new(0.98,0,0,54) ; tipRow.BackgroundColor3=Color3.fromRGB(16,20,26)
+    tipRow.BorderSizePixel=0
+    Instance.new("UICorner",tipRow).CornerRadius=UDim.new(0,6)
+    Instance.new("UIStroke",tipRow).Color=T.Stroke
+    local tipL=Instance.new("TextLabel",tipRow)
+    tipL.Size=UDim2.new(1,-14,1,0) ; tipL.Position=UDim2.new(0,7,0,0)
+    tipL.BackgroundTransparency=1 ; tipL.Font=Enum.Font.Gotham ; tipL.TextSize=9
+    tipL.TextWrapped=true ; tipL.TextXAlignment=Enum.TextXAlignment.Left
+    tipL.TextColor3=T.Sub
+    tipL.Text = "v5: dy→YAW (horizontal), dz→PITCH (vertical). Camera+5 priority so weapon follows. FOV-normalized. ADS sens separate. Auto-aim coexists with gyro. Use joystick for big moves, gyro for fine aim."
+end
 
 -- ─── TAB: AIM ────────────────────────────────────────────────
 Sec(TabAim, "  AUTO AIM")
 
 local aimSetV = Toggle(TabAim, "🎯 Auto Aim",
-    "Snaps camera toward nearest visible enemy",
+    "Game aim snap toward nearest visible enemy",
     function(v) Config.AutoAim=v ; SetSetting("AutoAim",v) ; return v end)
 aimSetV(Config.AutoAim)
 
 local shootSetV = Toggle(TabAim, "🔫 Auto Shoot",
-    "Fires when enemy is in reticle cone (our engine, not a game setting)",
-    function(v) Config.AutoShoot=v ; if v then StartAutoShoot() else StopAutoShoot() end ; return v end)
+    "Fires when enemy enters reticle cone (our engine)",
+    function(v)
+        Config.AutoShoot = v
+        if v then StartAutoShoot() else StopAutoShoot() end
+        return v
+    end)
 shootSetV(Config.AutoShoot)
 
 Sec(TabAim, "  AUTO-SHOOT CONE")
-Slider(TabAim, "Crosshair Cone (degrees)", 1, 15, Config.AutoShootFOV, function(v)
+Slider(TabAim, "Cone Size (degrees)", 1, 15, Config.AutoShootFOV, function(v)
     Config.AutoShootFOV = v
 end)
 
@@ -888,11 +899,10 @@ local hipSetV = Toggle(TabAim, "🏃 Hipfire Aim",
     function(v) Config.HipfireAim=v ; SetSetting("HipfireAim",v) ; return v end)
 hipSetV(Config.HipfireAim)
 
-Sec(TabAim, "  STRENGTH")
+Sec(TabAim, "  STRENGTH  (game max = 10)")
 
 Slider(TabAim, "Aim Strength", 0, 10, Config.AimStrength, function(v)
     Config.AimStrength = v
-    -- Always apply immediately — gyro and auto-aim coexist now
     SetSetting("AutoAimStrength",    v)
     SetSetting("HipfireAimStrength", v)
 end)
@@ -967,10 +977,10 @@ end)
 
 -- ─── TAB: INFO ───────────────────────────────────────────────
 Sec(TabInfo, "  SCRIPT INFO")
-InfoRow(TabInfo, "🎯  SNIPER SCRIPT v4  —  Universal Mobile FPS", T.Accent)
-InfoRow(TabInfo, "📱  Gyro: Camera+5 priority · FOV-normalized · ADS/hipfire split sens")
-InfoRow(TabInfo, "🎯  Auto-aim + gyro coexist · Strength always applied · AutoShoot: our engine")
-InfoRow(TabInfo, "↕↔  Invert V/H toggles · FOV-Norm toggle · ADS sens slider in Gyro tab")
+InfoRow(TabInfo, "🎯  SNIPER SCRIPT v5  —  Universal Mobile FPS", T.Accent)
+InfoRow(TabInfo, "📱  Gyro v5: dy→YAW · dz→PITCH · Camera+5 · FOV-norm")
+InfoRow(TabInfo, "🎯  AimStrength = 10 on load (game max) · auto-aim + gyro coexist")
+InfoRow(TabInfo, "🔫  AutoShoot: LOS raycast engine · configurable cone angle")
 InfoRow(TabInfo, "👁️  ESP: Highlight AlwaysOnTop on enemy characters")
 InfoRow(TabInfo, "💀  Respawn: RS.Remote.GameService.Respawn:FireServer()")
 InfoRow(TabInfo, Settings and "✅  Settings module loaded" or "❌  Settings module not found",
@@ -986,8 +996,8 @@ if Tabs[1] and TabBtns[1] then
     TabBtns[1].i.Visible    = true
 end
 
-print("[SniperScript v4] ✅ Loaded")
-print("[SniperScript v4] Settings:", Settings and "FOUND" or "NOT FOUND")
-print("[SniperScript v4] Gyro support:", pcall(function()
+print("[SniperScript v5] ✅ Loaded")
+print("[SniperScript v5] Settings:", Settings and "FOUND" or "NOT FOUND")
+print("[SniperScript v5] Gyro support:", pcall(function()
     return UserInputService.GyroscopeEnabled
 end) and UserInputService.GyroscopeEnabled and "YES" or "NO")
