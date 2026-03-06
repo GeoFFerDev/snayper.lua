@@ -1,5 +1,5 @@
 --[[
-  SNIPER SCRIPT v3 — Universal Mobile FPS
+  SNIPER SCRIPT v4 — Universal Mobile FPS
   ══════════════════════════════════════════════════════════════
   GYRO BUG ROOT CAUSES (all fixed):
   ──────────────────────────────────────────────────────────────
@@ -144,20 +144,10 @@ local gyroSavedAimStr  = nil
 local gyroSavedHipStr  = nil
 
 local function gyroInterlock(enabling)
-    -- Zero auto-aim strength when gyro turns on, restore when off
-    if enabling then
-        gyroSavedAimStr = GetSetting("AutoAimStrength", 5)
-        gyroSavedHipStr = GetSetting("HipfireAimStrength", 5)
-        SetSetting("AutoAimStrength", 0)
-        SetSetting("HipfireAimStrength", 0)
-    else
-        if gyroSavedAimStr ~= nil then
-            SetSetting("AutoAimStrength",  gyroSavedAimStr)
-            SetSetting("HipfireAimStrength", gyroSavedHipStr)
-            gyroSavedAimStr = nil
-            gyroSavedHipStr = nil
-        end
-    end
+    -- FIX: Previously zeroed AutoAimStrength to 0 when gyro enabled → auto-aim completely dead.
+    -- Now gyro and auto-aim coexist. We just ensure the configured strength is always applied.
+    SetSetting("AutoAimStrength",    Config.AimStrength)
+    SetSetting("HipfireAimStrength", Config.AimStrength)
 end
 
 -- Capture absolute device CFrame on every sensor update
@@ -209,9 +199,21 @@ RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Camera.Value + 5, fun
     dy = math.clamp(dy, -MAX, MAX)
     dz = math.clamp(dz, -MAX, MAX)
 
-    -- Scale: slider 1–10 → effective multiplier 0.15 – 1.5
-    local scaleV = Config.GyroSensV * 0.15
-    local scaleH = Config.GyroSensH * 0.15
+    -- FOV-NORMALIZED SENSITIVITY:
+    -- Game touch base FOV = 90. When scoped (~55 FOV) same phone tilt covers more screen.
+    -- Scale = currentFOV / BASE_FOV → hipfire (90) = 1.0x, scoped (55) = 0.61x.
+    -- This makes gyro feel equally "snappy" at all zoom levels.
+    local curFOV  = camera.FieldOfView
+    local fovMult = Config.GyroFOVNorm and (curFOV / BASE_FOV) or 1
+
+    -- Use ADS sensitivity when zoomed in (FOV < 75 = game applied scope zoom)
+    local isScoped = curFOV < 75
+    local sensV = isScoped and Config.GyroSensADS or Config.GyroSensV
+    local sensH = isScoped and Config.GyroSensADS or Config.GyroSensH
+
+    -- Scale: slider 1-10 * 0.15 = multiplier 0.15-1.5, then FOV-adjusted
+    local scaleV = sensV * 0.15 * fovMult
+    local scaleH = sensH * 0.15 * fovMult
 
     -- Sign convention (landscape right):
     --   Tilt top of phone away from you  → dy > 0 → aim DOWN  → pitch decreases
@@ -234,6 +236,88 @@ RunService:BindToRenderStep("SS_Gyro", Enum.RenderPriority.Camera.Value + 5, fun
     camera.CFrame = CFrame.new(camCF.Position)
         * CFrame.fromEulerAnglesYXZ(newPitch, newYaw, 0)
 end)
+
+-- ═════════════════════════════════════════════════════════════
+--  AUTO-SHOOT ENGINE
+-- ═════════════════════════════════════════════════════════════
+--  SetSetting("AutoShoot", true) only enables hold-ADS on touch.
+--  It does NOT fire the weapon. We implement true auto-shoot:
+--    1. Heartbeat: scan living enemy characters.
+--    2. Measure angle between camera LookVector and enemy Head.
+--    3. If within AutoShootFOV degrees + line-of-sight: Activate() tool.
+-- ═════════════════════════════════════════════════════════════
+
+local function GetEquippedTool()
+    local char = player.Character
+    if not char then return nil end
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("Tool") then return v end
+    end
+end
+
+local autoShootConn = nil
+
+local function StartAutoShoot()
+    if autoShootConn then autoShootConn:Disconnect() ; autoShootConn = nil end
+    if not Config.AutoShoot then return end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    autoShootConn = RunService.Heartbeat:Connect(function()
+        if not Config.AutoShoot then return end
+        local tool = GetEquippedTool()
+        if not tool then return end
+        local char = player.Character
+        if not char then return end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then return end
+
+        rayParams.FilterDescendantsInstances = { char }
+        local camCF   = camera.CFrame
+        local camPos  = camCF.Position
+        local camLook = camCF.LookVector
+        local fovRad  = math.rad(Config.AutoShootFOV)
+
+        local bestAngle = fovRad
+        local shouldFire = false
+
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p == player then continue end
+            local ec = p.Character
+            if not ec then continue end
+            local eh = ec:FindFirstChildOfClass("Humanoid")
+            if not eh or eh.Health <= 0 then continue end
+            -- Team check
+            local enemy = true
+            pcall(function()
+                enemy = not player.Team or not p.Team or player.Team ~= p.Team
+            end)
+            if not enemy then continue end
+            local tPart = ec:FindFirstChild("Head") or ec:FindFirstChild("HumanoidRootPart")
+            if not tPart then continue end
+            local tPos  = tPart.Position
+            local toT   = (tPos - camPos).Unit
+            local angle = math.acos(math.clamp(camLook:Dot(toT), -1, 1))
+            if angle < bestAngle then
+                local dist   = (tPos - camPos).Magnitude
+                local result = workspace:Raycast(camPos, toT * dist, rayParams)
+                if not result or result.Instance:IsDescendantOf(ec) then
+                    bestAngle  = angle
+                    shouldFire = true
+                end
+            end
+        end
+
+        if shouldFire then
+            pcall(function() tool:Activate() end)
+        end
+    end)
+end
+
+local function StopAutoShoot()
+    if autoShootConn then autoShootConn:Disconnect() ; autoShootConn = nil end
+end
 
 -- ═════════════════════════════════════════════════════════════
 --  ESP ENGINE
@@ -324,7 +408,7 @@ local function LoadLabel(parent, text, size, y, color)
     return l
 end
 LoadLabel(bg, "SNIPER SCRIPT", 38, 0.22, Color3.fromRGB(0,200,150))
-LoadLabel(bg, "Mobile FPS  ·  Gyro v3  +  AutoAim  +  ESP", 13, 0.36, Color3.fromRGB(60,130,100))
+LoadLabel(bg, "Mobile FPS  ·  Gyro v4  +  AutoShoot  +  ESP", 13, 0.36, Color3.fromRGB(60,130,100))
 
 -- Route dots
 local RDOTS = {"⚙️ Init","◆ Settings","◆ Gyro","◆ ESP","🎯 Ready"}
@@ -404,7 +488,7 @@ end
 
 SetProg(5,  "Initialising...",     1) ; task.wait(0.2)
 SetProg(25, "Hooking settings...", 2) ; task.wait(0.25)
-SetProg(50, "Gyro engine v3...",   3) ; task.wait(0.25)
+SetProg(50, "Gyro engine v4...",   3) ; task.wait(0.25)
 SetProg(75, "ESP highlights...",   4) ; task.wait(0.25)
 SetProg(95, "Finalising...",       5) ; task.wait(0.2)
 SetProg(100,"Ready!")                  ; task.wait(0.5)
@@ -479,6 +563,7 @@ end
 BarBtn("✕", UDim2.new(1,-32,0.5,-11), Color3.fromRGB(255,80,80), function()
     RunService:UnbindFromRenderStep("SS_Gyro")
     if Config.Gyro then gyroInterlock(false) end
+    StopAutoShoot()
     ScreenGui:Destroy()
 end)
 BarBtn("—", UDim2.new(1,-62,0.5,-11), T.Sub, function()
@@ -789,9 +874,14 @@ local aimSetV = Toggle(TabAim, "🎯 Auto Aim",
 aimSetV(Config.AutoAim)
 
 local shootSetV = Toggle(TabAim, "🔫 Auto Shoot",
-    "Fires automatically when target is in reticle",
-    function(v) Config.AutoShoot=v ; SetSetting("AutoShoot",v) ; return v end)
+    "Fires when enemy is in reticle cone (our engine, not a game setting)",
+    function(v) Config.AutoShoot=v ; if v then StartAutoShoot() else StopAutoShoot() end ; return v end)
 shootSetV(Config.AutoShoot)
+
+Sec(TabAim, "  AUTO-SHOOT CONE")
+Slider(TabAim, "Crosshair Cone (degrees)", 1, 15, Config.AutoShootFOV, function(v)
+    Config.AutoShootFOV = v
+end)
 
 local hipSetV = Toggle(TabAim, "🏃 Hipfire Aim",
     "Auto-aim applies even when not ADS",
@@ -802,15 +892,9 @@ Sec(TabAim, "  STRENGTH")
 
 Slider(TabAim, "Aim Strength", 0, 10, Config.AimStrength, function(v)
     Config.AimStrength = v
-    -- Only apply to game setting if gyro is NOT on (gyro zeroes this for interlock)
-    if not Config.Gyro then
-        SetSetting("AutoAimStrength",   v)
-        SetSetting("HipfireAimStrength", v)
-    else
-        -- Update saved value so it restores correctly when gyro turns off
-        gyroSavedAimStr = v
-        gyroSavedHipStr = v
-    end
+    -- Always apply immediately — gyro and auto-aim coexist now
+    SetSetting("AutoAimStrength",    v)
+    SetSetting("HipfireAimStrength", v)
 end)
 
 Sec(TabAim, "  ADVANCED")
@@ -883,10 +967,10 @@ end)
 
 -- ─── TAB: INFO ───────────────────────────────────────────────
 Sec(TabInfo, "  SCRIPT INFO")
-InfoRow(TabInfo, "🎯  SNIPER SCRIPT v3  —  Universal Mobile FPS", T.Accent)
-InfoRow(TabInfo, "📱  Gyro: DeviceRotationChanged 2nd param → Last(2000)")
-InfoRow(TabInfo, "🔇  Auto-aim zeroed while gyro on (no more sliding)")
-InfoRow(TabInfo, "↕↔  Invert V/H toggles if axis direction feels wrong")
+InfoRow(TabInfo, "🎯  SNIPER SCRIPT v4  —  Universal Mobile FPS", T.Accent)
+InfoRow(TabInfo, "📱  Gyro: Camera+5 priority · FOV-normalized · ADS/hipfire split sens")
+InfoRow(TabInfo, "🎯  Auto-aim + gyro coexist · Strength always applied · AutoShoot: our engine")
+InfoRow(TabInfo, "↕↔  Invert V/H toggles · FOV-Norm toggle · ADS sens slider in Gyro tab")
 InfoRow(TabInfo, "👁️  ESP: Highlight AlwaysOnTop on enemy characters")
 InfoRow(TabInfo, "💀  Respawn: RS.Remote.GameService.Respawn:FireServer()")
 InfoRow(TabInfo, Settings and "✅  Settings module loaded" or "❌  Settings module not found",
@@ -902,8 +986,8 @@ if Tabs[1] and TabBtns[1] then
     TabBtns[1].i.Visible    = true
 end
 
-print("[SniperScript v3] ✅ Loaded")
-print("[SniperScript v3] Settings:", Settings and "FOUND" or "NOT FOUND")
-print("[SniperScript v3] Gyro support:", pcall(function()
+print("[SniperScript v4] ✅ Loaded")
+print("[SniperScript v4] Settings:", Settings and "FOUND" or "NOT FOUND")
+print("[SniperScript v4] Gyro support:", pcall(function()
     return UserInputService.GyroscopeEnabled
 end) and UserInputService.GyroscopeEnabled and "YES" or "NO")
